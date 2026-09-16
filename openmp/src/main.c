@@ -6,7 +6,7 @@
 #include <omp.h>
 
 #include "perlin.h"
-#include "marching_cubes.h"
+#include "terrain_openmp.h"
 #include "obj_export.h"
 
 typedef struct {
