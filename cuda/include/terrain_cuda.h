@@ -15,7 +15,7 @@ int cuda_generate_heightmap(float **d_heightmap_out, int Nx, int Nz,
                             float frequency, float base_height, float amplitude,
                             double *time_seconds);
 
-TriMesh cuda_marching_cubes(const float *d_heightmap, int Nx, int Nz, int Ny, float isovalue,
+TriMesh cuda_marching_cubes(const float *d_heightmap, int Nx, int Ny, int Nz, float isovalue,
                             double *time_seconds);
 
 void cuda_free_heightmap(float *d_heightmap);

@@ -286,7 +286,7 @@ __global__ void mc_emit_kernel(const float *heightmap, int Nx,
     }
 }
 
-TriMesh cuda_marching_cubes(const float *d_heightmap, int Nx, int Nz, int Ny, float isovalue,
+TriMesh cuda_marching_cubes(const float *d_heightmap, int Nx, int Ny, int Nz, float isovalue,
                              double *time_seconds) {
     double t0 = now_seconds();
 
@@ -301,8 +301,7 @@ TriMesh cuda_marching_cubes(const float *d_heightmap, int Nx, int Nz, int Ny, fl
     CUDA_CHECK(cudaMalloc((void **)&d_total, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(d_total, 0, sizeof(unsigned long long)));
 
-    mc_count_total_kernel<<<blocks, threads>>>(d_heightmap, Nx, cellsX, cellsY, isovalue,
-                                                cells_total, d_total);
+    mc_count_total_kernel<<<blocks, threads>>>(d_heightmap, Nx, cellsX, cellsY, isovalue, cells_total, d_total);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
