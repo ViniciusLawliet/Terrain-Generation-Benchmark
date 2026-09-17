@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
     PerlinState perlin_state;
     perlin_init(&perlin_state, params.seed);
 
-    double t0 = omp_get_wtime(); // Perlin Noise (Heightmap 2D + Field 3D)
+    double t0 = omp_get_wtime(); // Perlin Noise (Heightmap)
 
     float base_height = 0.5f * (float)Ny;
 
