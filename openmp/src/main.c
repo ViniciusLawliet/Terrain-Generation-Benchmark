@@ -147,11 +147,12 @@ int main(int argc, char **argv) {
 
     double t2 = omp_get_wtime(); // Export Mesh OBJ
 
+    free(heightmap);
+
     if (params.output_set) {
         int rc = export_obj(params.output, &mesh, nthreads);
         if (rc != 0) {
             fprintf(stderr, "Error: could not write to '%s'\n", params.output);
-            free(heightmap);
             trimesh_free(&mesh);
             return 1;
         }
@@ -166,7 +167,6 @@ int main(int argc, char **argv) {
     printf("num_triangles: %zu\n", mesh.triangle_count);
     printf("num_vertices: %zu\n", mesh.vertex_count);
 
-    free(heightmap);
     trimesh_free(&mesh);
 
     return 0;
