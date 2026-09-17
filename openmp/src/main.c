@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
     float *heightmap = (float *)malloc(heightmap_elems * sizeof(float));
 
     if (!heightmap) {
-        fprintf(stderr, "Error: memory allocation failed (heightmap=%zu, field=%zu elements)\n", heightmap_elems);
+        fprintf(stderr, "Error: memory allocation failed (heightmap=%zu elements)\n", heightmap_elems);
         free(heightmap);
         return 1;
     }
@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
 
     double t3 = omp_get_wtime(); // End
 
-    printf("perlin_time_s: %.6f\n", t1 - t0);
+    printf("field_time_s: %.6f\n", t1 - t0);
     printf("marching_cubes_time_s: %.6f\n", t2 - t1);
     printf("obj_export_time_s: %.6f\n", t3 - t2);
     printf("total_time_s: %.6f\n", t3 - t0);

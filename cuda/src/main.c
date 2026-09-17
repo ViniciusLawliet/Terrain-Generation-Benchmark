@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("perlin_time_s: %.6f\n", t_field);
+    printf("field_time_s: %.6f\n", t_field);
     printf("marching_cubes_time_s: %.6f\n", t_mc);
     printf("obj_export_time_s: %.6f\n", t3 - t2);
     printf("total_time_s: %.6f\n", t_field + t_mc + (t3 - t2));
