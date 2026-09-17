@@ -12,10 +12,6 @@ typedef struct {
     size_t _pad[5];
 } ThreadTriBuffer;
 
-static inline size_t field_index(int i, int j, int k, int Nx, int Ny) {
-    return (size_t)k * (size_t)Nx * (size_t)Ny + (size_t)j * (size_t)Nx + (size_t)i;
-}
-
 static void tribuffer_reserve(ThreadTriBuffer *tb, size_t extra) {
     if (tb->count + extra <= tb->capacity) return;
     size_t newcap = tb->capacity ? tb->capacity * 2 : 1536;
@@ -31,20 +27,29 @@ static inline void tribuffer_push_triangle(ThreadTriBuffer *tb, Vec3 a, Vec3 b, 
     tb->data[tb->count++] = c;
 }
 
-static void mc_process_cell(const float *field, int Nx, int Ny, int i, int j, int k,
+static void mc_process_cell(const float *heightmap, int Nx, int i, int j, int k,
                              float isovalue, ThreadTriBuffer *tb) {
+    float h00 = heightmap[(size_t)k * Nx + i];
+    float h10 = heightmap[(size_t)k * Nx + (i + 1)];
+    float h01 = heightmap[(size_t)(k + 1) * Nx + i];
+    float h11 = heightmap[(size_t)(k + 1) * Nx + (i + 1)];
+
     float cornerVal[8];
+    cornerVal[0] = h00 - (float)j;
+    cornerVal[1] = h10 - (float)j;
+    cornerVal[2] = h10 - (float)(j + 1);
+    cornerVal[3] = h00 - (float)(j + 1);
+    cornerVal[4] = h01 - (float)j;
+    cornerVal[5] = h11 - (float)j;
+    cornerVal[6] = h11 - (float)(j + 1);
+    cornerVal[7] = h01 - (float)(j + 1);
+
     Vec3 cornerPos[8];
     int idx = 0;
-
     for (int c = 0; c < 8; c++) {
-        int ci = i + vertexOffset[c][0];
-        int cj = j + vertexOffset[c][1];
-        int ck = k + vertexOffset[c][2];
-        cornerVal[c] = field[field_index(ci, cj, ck, Nx, Ny)];
-        cornerPos[c].x = (float)ci;
-        cornerPos[c].y = (float)cj;
-        cornerPos[c].z = (float)ck;
+        cornerPos[c].x = (float)(i + vertexOffset[c][0]);
+        cornerPos[c].y = (float)(j + vertexOffset[c][1]);
+        cornerPos[c].z = (float)(k + vertexOffset[c][2]);
         if (cornerVal[c] >= isovalue) idx |= (1 << c);
     }
 
@@ -75,7 +80,7 @@ static void mc_process_cell(const float *field, int Nx, int Ny, int i, int j, in
     }
 }
 
-TriMesh marching_cubes_run(const float *field, int Nx, int Ny, int Nz, float isovalue, int num_threads) {
+TriMesh marching_cubes_run(const float *heightmap, int Nx, int Ny, int Nz, float isovalue, int num_threads) {
     int nthreads = num_threads > 0 ? num_threads : omp_get_max_threads();
     omp_set_num_threads(nthreads);
 
@@ -96,7 +101,7 @@ TriMesh marching_cubes_run(const float *field, int Nx, int Ny, int Nz, float iso
         for (int k = 0; k < cells_z; k++) {
             for (int j = 0; j < cells_y; j++) {
                 for (int i = 0; i < cells_x; i++) {
-                    mc_process_cell(field, Nx, Ny, i, j, k, isovalue, tb);
+                    mc_process_cell(heightmap, Nx, i, j, k, isovalue, tb);
                 }
             }
         }

@@ -40,7 +40,7 @@ static void print_usage(const char *prog) {
         "  -h                Show this help message\n"
         "\n"
         "Example:\n"
-        "  %s -x 1024 -z 1024 -y 256 -o terrain.obj\n",
+        "  %s -x 256 -z 256 -y 128 -o terrain.obj\n",
         prog, prog);
 }
 
@@ -115,15 +115,12 @@ int main(int argc, char **argv) {
     printf("output: %s\n", params.output_set ? params.output : "(disabled)");
 
     size_t heightmap_elems = (size_t)Nx * (size_t)Nz;
-    size_t field_elems = (size_t)Nx * (size_t)Ny * (size_t)Nz;
 
     float *heightmap = (float *)malloc(heightmap_elems * sizeof(float));
-    float *field = (float *)malloc(field_elems * sizeof(float));
 
-    if (!heightmap || !field) {
-        fprintf(stderr, "Error: memory allocation failed (heightmap=%zu, field=%zu elements)\n", heightmap_elems, field_elems);
+    if (!heightmap) {
+        fprintf(stderr, "Error: memory allocation failed (heightmap=%zu, field=%zu elements)\n", heightmap_elems);
         free(heightmap);
-        free(field);
         return 1;
     }
 
@@ -144,22 +141,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    #pragma omp parallel for collapse(3) schedule(static)
-    for (int k = 0; k < Nz; k++) {
-        for (int j = 0; j < Ny; j++) {
-            for (int i = 0; i < Nx; i++) {
-                float height = heightmap[(size_t)k * Nx + i];
-                size_t idx = (size_t)k * Nx * Ny + (size_t)j * Nx + i;
-                field[idx] = height - (float)j;
-            }
-        }
-    }
-
-    free(heightmap);
-
     double t1 = omp_get_wtime(); // Marching Cubes
 
-    TriMesh mesh = marching_cubes_run(field, Nx, Ny, Nz, params.isovalue, nthreads);
+    TriMesh mesh = marching_cubes_run(heightmap, Nx, Ny, Nz, params.isovalue, nthreads);
 
     double t2 = omp_get_wtime(); // Export Mesh OBJ
 
@@ -167,7 +151,7 @@ int main(int argc, char **argv) {
         int rc = export_obj(params.output, &mesh, nthreads);
         if (rc != 0) {
             fprintf(stderr, "Error: could not write to '%s'\n", params.output);
-            free(field);
+            free(heightmap);
             trimesh_free(&mesh);
             return 1;
         }
@@ -182,7 +166,7 @@ int main(int argc, char **argv) {
     printf("num_triangles: %zu\n", mesh.triangle_count);
     printf("num_vertices: %zu\n", mesh.vertex_count);
 
-    free(field);
+    free(heightmap);
     trimesh_free(&mesh);
 
     return 0;
