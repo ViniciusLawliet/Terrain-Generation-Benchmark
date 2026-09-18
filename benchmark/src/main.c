@@ -153,7 +153,7 @@ static int run_child(char **target_argv, RunResult *result) {
         if (dup2(pipefd[1], STDOUT_FILENO) < 0)
             _exit(126);
         close(pipefd[1]);
-        execv(target_argv[0], target_argv);
+        execvp(target_argv[0], target_argv);
         _exit(127);
     }
 
@@ -219,6 +219,7 @@ static int run_child(char **target_argv, RunResult *result) {
 static int measure_batch(char **target_argv,
                          const RaplContext *rapl,
                          GpuEnergyContext *gpu,
+                         int gpu_requested,
                          int batch_id,
                          int first_run,
                          int batch_size,
@@ -278,10 +279,13 @@ static int measure_batch(char **target_argv,
         batch->gpu_energy_valid = gpu_energy_measurement_valid(gpu) && isfinite(gpu_j);
     }
 
-    if (!gpu) {
+    if (!gpu_requested) {
+        /* CPU-only benchmark: RAPL is sufficient for the measured total. */
         batch->total_energy_j = batch->cpu_energy_j;
         batch->total_energy_valid = batch->cpu_energy_valid;
     } else if (batch->cpu_energy_valid && batch->gpu_energy_valid) {
+        /* GPU was explicitly requested, so a combined total is valid only
+         * when both CPU and GPU measurements were obtained. */
         batch->total_energy_j = batch->cpu_energy_j + batch->gpu_energy_j;
         batch->total_energy_valid = 1;
     }
@@ -298,9 +302,9 @@ static int measure_batch(char **target_argv,
             results[i].application_time_s = results[i].process_wall_time_s;
 
         if (isfinite(results[i].total_energy_j) &&
-            isfinite(results[i].application_time_s)) {
+            isfinite(results[i].process_wall_time_s)) {
             results[i].edp_j_s = results[i].total_energy_j *
-                                 results[i].application_time_s;
+                                 results[i].process_wall_time_s;
         }
     }
 
@@ -441,7 +445,6 @@ int main(int argc, char **argv) {
 
     if (!rapl.available) {
         fprintf(stderr, "Warning: RAPL unavailable; CPU package energy will be N/A.\n");
-        // exit(1);
     }
 
     GpuEnergyContext *gpu = NULL;
@@ -449,7 +452,11 @@ int main(int argc, char **argv) {
         gpu = gpu_energy_init(gpu_index);
         if (!gpu) {
             fprintf(stderr, "Warning: GPU energy measurement unavailable.\n");
-            // exit(1);
+            fprintf(stderr, "         NVML could not be initialized or the selected GPU has no supported power sensor.\n");
+            fprintf(stderr, "         Run: nvidia-smi --query-gpu=name,power.draw --format=csv\n");
+        } else {
+            fprintf(stderr, "GPU energy: %s (%s)\n",
+                    gpu_energy_device_name(gpu), gpu_energy_method(gpu));
         }
     }
 
@@ -458,7 +465,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warm-up %d/%d...\n", i + 1, warmup);
         if (run_child(target_argv, &warm) != 0) {
             fprintf(stderr, "Error during warm-up.\n");
-            if (gpu) gpu_energy_shutdown(gpu);
+            if (gpu) gpu_energy_destroy(gpu);
             free(target_argv);
             return 1;
         }
@@ -472,7 +479,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: insufficient memory for benchmark results.\n");
         free(results);
         free(batches);
-        if (gpu) gpu_energy_shutdown(gpu);
+        if (gpu) gpu_energy_destroy(gpu);
         free(target_argv);
         return 1;
     }
@@ -491,7 +498,7 @@ int main(int argc, char **argv) {
                 completed + this_batch,
                 reps);
 
-        if (measure_batch(target_argv, &rapl, gpu,
+        if (measure_batch(target_argv, &rapl, gpu, use_gpu,
                           completed_batches + 1,
                           completed + 1,
                           this_batch,
@@ -500,7 +507,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error during benchmark execution.\n");
             free(results);
             free(batches);
-            if (gpu) gpu_energy_shutdown(gpu);
+            if (gpu) gpu_energy_destroy(gpu);
             free(target_argv);
             return 1;
         }
@@ -525,7 +532,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: insufficient memory for statistics.\n");
         free(times); free(cpu_e); free(gpu_e); free(total_energy_values); free(edp);
         free(results); free(batches);
-        if (gpu) gpu_energy_shutdown(gpu);
+        if (gpu) gpu_energy_destroy(gpu);
         free(target_argv);
         return 1;
     }
@@ -570,11 +577,11 @@ int main(int argc, char **argv) {
                 int ok = 1;
 
                 for (int i = 0; i < size; ++i) {
-                    if (!isfinite(results[begin + i].application_time_s)) {
+                    if (!isfinite(results[begin + i].process_wall_time_s)) {
                         ok = 0;
                         break;
                     }
-                    batch_mean_time += results[begin + i].application_time_s;
+                    batch_mean_time += results[begin + i].process_wall_time_s;
                 }
 
                 if (!ok) {
@@ -690,7 +697,7 @@ int main(int argc, char **argv) {
         fclose(summary);
     }
 
-    printf("\nBENCHMARK RESULT\n");
+    printf("\n========== BENCHMARK RESULT ==========\n");
     printf("executions_requested: %d\n", reps);
     printf("executions_valid: %d\n", successful);
     printf("warmup: %d\n", warmup);
@@ -741,7 +748,7 @@ int main(int argc, char **argv) {
 
     free(times); free(cpu_e); free(gpu_e); free(total_energy_values); free(edp);
     free(results); free(batches);
-    if (gpu) gpu_energy_shutdown(gpu);
+    if (gpu) gpu_energy_destroy(gpu);
     free(target_argv);
 
     return 0;
