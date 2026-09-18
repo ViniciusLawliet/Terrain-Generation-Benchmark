@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <getopt.h>
 #include <math.h>
 #include <stdio.h>
@@ -130,7 +132,7 @@ static void parse_child_output(const char *buf, RunResult *r) {
     }
 }
 
-static int run_child(char **target_argv, RunResult *result) {
+static int run_child(char **target_argv, RunResult *result, GpuEnergyContext *gpu) {
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -159,44 +161,98 @@ static int run_child(char **target_argv, RunResult *result) {
 
     close(pipefd[1]);
 
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0)
+        (void)fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+
     char *outbuf = NULL;
     size_t outcap = 0;
     size_t outlen = 0;
     char chunk[4096];
-    ssize_t n;
+    int pipe_open = 1;
+    int child_done = 0;
+    int status = 0;
 
-    while ((n = read(pipefd[0], chunk, sizeof(chunk))) > 0) {
-        if (outlen + (size_t)n + 1 > outcap) {
-            size_t newcap = outcap ? outcap * 2 : 8192;
-            while (newcap < outlen + (size_t)n + 1)
-                newcap *= 2;
+    while (!child_done || pipe_open) {
+        if (pipe_open) {
+            struct pollfd pfd;
+            pfd.fd = pipefd[0];
+            pfd.events = POLLIN | POLLHUP | POLLERR;
+            pfd.revents = 0;
 
-            char *tmp = (char *)realloc(outbuf, newcap);
-            if (!tmp) {
-                fprintf(stderr, "Error: insufficient memory while capturing stdout.\n");
+            int prc = poll(&pfd, 1, 50);
+            if (prc < 0 && errno != EINTR) {
+                perror("poll");
                 free(outbuf);
                 close(pipefd[0]);
                 waitpid(pid, NULL, 0);
                 return -1;
             }
 
-            outbuf = tmp;
-            outcap = newcap;
+            if (prc > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+                for (;;) {
+                    ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+                    if (n > 0) {
+                        if (outlen + (size_t)n + 1 > outcap) {
+                            size_t newcap = outcap ? outcap * 2 : 8192;
+                            while (newcap < outlen + (size_t)n + 1)
+                                newcap *= 2;
+
+                            char *tmp = (char *)realloc(outbuf, newcap);
+                            if (!tmp) {
+                                fprintf(stderr, "Error: insufficient memory while capturing stdout.\n");
+                                free(outbuf);
+                                close(pipefd[0]);
+                                waitpid(pid, NULL, 0);
+                                return -1;
+                            }
+
+                            outbuf = tmp;
+                            outcap = newcap;
+                        }
+
+                        memcpy(outbuf + outlen, chunk, (size_t)n);
+                        outlen += (size_t)n;
+                        outbuf[outlen] = '\0';
+                        continue;
+                    }
+
+                    if (n == 0) {
+                        pipe_open = 0;
+                        break;
+                    }
+
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                        break;
+
+                    perror("read");
+                    pipe_open = 0;
+                    break;
+                }
+            }
+        } else {
+            struct timespec req = { .tv_sec = 0, .tv_nsec = 5 * 1000000L };
+            nanosleep(&req, NULL);
         }
 
-        memcpy(outbuf + outlen, chunk, (size_t)n);
-        outlen += (size_t)n;
-        outbuf[outlen] = '\0';
+        /* Drain NVML's own sample buffer while the child is running.  This
+         * avoids losing old samples on GPUs whose internal history is finite. */
+        gpu_energy_poll(gpu);
+
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("waitpid");
+            free(outbuf);
+            close(pipefd[0]);
+            return -1;
+        }
+        if (w == pid)
+            child_done = 1;
     }
 
     close(pipefd[0]);
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        perror("waitpid");
-        free(outbuf);
-        return -1;
-    }
 
     double t1 = now_seconds();
 
@@ -246,7 +302,7 @@ static int measure_batch(char **target_argv,
     double t0 = now_seconds();
 
     for (int i = 0; i < batch_size; ++i) {
-        if (run_child(target_argv, &results[i]) != 0) {
+        if (run_child(target_argv, &results[i], gpu) != 0) {
             if (gpu)
                 (void)gpu_energy_stop_joules(gpu);
             return -1;
@@ -463,7 +519,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < warmup; ++i) {
         RunResult warm;
         fprintf(stderr, "Warm-up %d/%d...\n", i + 1, warmup);
-        if (run_child(target_argv, &warm) != 0) {
+        if (run_child(target_argv, &warm, NULL) != 0) {
             fprintf(stderr, "Error during warm-up.\n");
             if (gpu) gpu_energy_destroy(gpu);
             free(target_argv);

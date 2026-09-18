@@ -1,441 +1,476 @@
-#define _GNU_SOURCE
 #include "gpu_energy.h"
-
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <math.h>
-#include <stdatomic.h>
 
 #ifdef WITH_NVML
 #include <nvml.h>
-#include <pthread.h>
 
-/*
- * NVML power telemetry strategy:
- *
- * 1. Prefer nvmlDeviceGetTotalEnergyConsumption() when supported.
- * 2. Otherwise use NVML_TOTAL_POWER_SAMPLES through nvmlDeviceGetSamples().
- */
-
-#define SAMPLE_POLL_INTERVAL_MS 10U
+typedef enum {
+    GPU_POWER_TOTAL_ENERGY = 0,
+    GPU_POWER_SAMPLES_BUFFER = 1
+} GpuPowerMethod;
 
 struct GpuEnergyContext {
     nvmlDevice_t device;
+    GpuPowerMethod method;
 
-    int use_total_energy_api;
     unsigned long long start_total_mj;
+    int start_valid;
 
-    int power_samples_supported;
+    unsigned long long sample_start_us;
+    unsigned long long sample_end_us;
+    unsigned long long last_seen_us;
 
-    pthread_t thread;
-    int thread_created;
-    atomic_int running;
+    unsigned long long last_sample_ts;
+    unsigned int last_sample_mw;
+    int last_sample_valid;
 
-    /* Integration of P(t) using the timestamps supplied by NVML. */
     double sampled_energy_j;
+    unsigned int sample_count;
+    int last_measurement_valid;
 
-    unsigned long long last_seen_timestamp_us;
-    unsigned long long previous_timestamp_us;
-    unsigned int previous_power_mw;
-    int have_previous_sample;
-
-    unsigned long long sample_count;
-
-    int measurement_valid;
-    char method[64];
+    char device_name[NVML_DEVICE_NAME_V2_BUFFER_SIZE];
+    char last_error[512];
 };
 
-static void sleep_ms(unsigned int ms) {
-    struct timespec req;
-    req.tv_sec = ms / 1000U;
-    req.tv_nsec = (long)(ms % 1000U) * 1000000L;
-    nanosleep(&req, NULL);
+static void append_error(GpuEnergyContext *ctx, const char *where, nvmlReturn_t rc) {
+    if (!ctx) return;
+
+    char line[256];
+    snprintf(line, sizeof(line), "%s: %s (%d)", where, nvmlErrorString(rc), (int)rc);
+
+    if (ctx->last_error[0] == '\0') {
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "%s", line);
+    } else {
+        size_t used = strlen(ctx->last_error);
+        if (used + 2 < sizeof(ctx->last_error)) {
+            snprintf(ctx->last_error + used,
+                     sizeof(ctx->last_error) - used,
+                     "; %s", line);
+        }
+    }
 }
 
-/*
- * Retrieve all total-power samples newer than last_seen.
- */
-static nvmlReturn_t fetch_power_samples(
-    GpuEnergyContext *ctx,
-    unsigned long long last_seen,
-    nvmlSample_t **samples_out,
-    unsigned int *count_out)
-{
-    if (!ctx || !samples_out || !count_out)
-        return NVML_ERROR_INVALID_ARGUMENT;
+static unsigned long long realtime_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return 0ULL;
 
-    *samples_out = NULL;
-    *count_out = 0;
+    return (unsigned long long)ts.tv_sec * 1000000ULL +
+           (unsigned long long)ts.tv_nsec / 1000ULL;
+}
 
-    nvmlValueType_t value_type;
+static nvmlReturn_t probe_power_samples(GpuEnergyContext *ctx) {
+    nvmlValueType_t value_type = NVML_VALUE_TYPE_UNSIGNED_INT;
     unsigned int count = 0;
 
     nvmlReturn_t rc = nvmlDeviceGetSamples(
         ctx->device,
         NVML_TOTAL_POWER_SAMPLES,
-        last_seen,
+        0,
         &value_type,
         &count,
-        NULL
-    );
+        NULL);
 
-    if (rc != NVML_SUCCESS)
+    if (rc == NVML_SUCCESS || rc == NVML_ERROR_NOT_FOUND)
         return rc;
 
-    if (value_type != NVML_VALUE_TYPE_UNSIGNED_INT) {
-        fprintf(stderr, "NVML: unexpected value type for power samples: %d\n", (int)value_type);
-        return NVML_ERROR_UNKNOWN;
+    append_error(ctx, "nvmlDeviceGetSamples(probe)", rc);
+    return rc;
+}
+
+static nvmlReturn_t get_power_samples_since(GpuEnergyContext *ctx,
+                                            unsigned long long last_seen_us,
+                                            nvmlSample_t **samples_out,
+                                            unsigned int *count_out) {
+    *samples_out = NULL;
+    *count_out = 0;
+
+    nvmlValueType_t value_type = NVML_VALUE_TYPE_UNSIGNED_INT;
+    unsigned int count = 0;
+
+    nvmlReturn_t rc = nvmlDeviceGetSamples(
+        ctx->device,
+        NVML_TOTAL_POWER_SAMPLES,
+        last_seen_us,
+        &value_type,
+        &count,
+        NULL);
+
+    if (rc == NVML_ERROR_NOT_FOUND)
+        return rc;
+
+    if (rc != NVML_SUCCESS) {
+        append_error(ctx, "nvmlDeviceGetSamples(size)", rc);
+        return rc;
     }
 
     if (count == 0)
         return NVML_ERROR_NOT_FOUND;
 
-    nvmlSample_t *samples = calloc(count, sizeof(*samples));
-    if (!samples)
-        return NVML_ERROR_MEMORY;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        nvmlSample_t *samples = calloc(count, sizeof(*samples));
+        if (!samples)
+            return NVML_ERROR_INSUFFICIENT_SIZE;
 
-    unsigned int actual_count = count;
+        unsigned int capacity = count;
+        value_type = NVML_VALUE_TYPE_UNSIGNED_INT;
 
-    rc = nvmlDeviceGetSamples(
-        ctx->device,
-        NVML_TOTAL_POWER_SAMPLES,
-        last_seen,
-        &value_type,
-        &actual_count,
-        samples
-    );
+        rc = nvmlDeviceGetSamples(
+            ctx->device,
+            NVML_TOTAL_POWER_SAMPLES,
+            last_seen_us,
+            &value_type,
+            &capacity,
+            samples);
 
-    if (rc != NVML_SUCCESS) {
+        if (rc == NVML_SUCCESS) {
+            *samples_out = samples;
+            *count_out = capacity;
+            return NVML_SUCCESS;
+        }
+
         free(samples);
-        return rc;
+
+        if (rc != NVML_ERROR_INSUFFICIENT_SIZE) {
+            append_error(ctx, "nvmlDeviceGetSamples(data)", rc);
+            return rc;
+        }
+
+        count = capacity;
+        if (count == 0)
+            return NVML_ERROR_NOT_FOUND;
     }
 
-    *samples_out = samples;
-    *count_out = actual_count;
-    return NVML_SUCCESS;
+    append_error(ctx, "nvmlDeviceGetSamples: size changed repeatedly",
+                 NVML_ERROR_UNKNOWN);
+    return NVML_ERROR_UNKNOWN;
 }
 
-/*
- * Integrate power samples with trapezoidal integration:
- *
- * E = sum((P_i + P_(i-1))/2 * dt)
- *
- * Power is supplied in mW, timestamps in microseconds.
- */
-static void consume_samples(GpuEnergyContext *ctx, const nvmlSample_t *samples, unsigned int count) {
+static int sample_cmp_timestamp(const void *a, const void *b) {
+    const nvmlSample_t *sa = (const nvmlSample_t *)a;
+    const nvmlSample_t *sb = (const nvmlSample_t *)b;
 
-    if (!ctx || !samples)
+    if (sa->timeStamp < sb->timeStamp) return -1;
+    if (sa->timeStamp > sb->timeStamp) return 1;
+    return 0;
+}
+
+static void integrate_between(GpuEnergyContext *ctx,
+                              unsigned long long t_us,
+                              unsigned int power_mw) {
+    if (!ctx || !ctx->last_sample_valid)
         return;
+
+    if (t_us <= ctx->last_sample_ts)
+        return;
+
+    unsigned long long start_us = ctx->last_sample_ts;
+    unsigned long long end_us = t_us;
+    double avg_w = ((double)ctx->last_sample_mw + (double)power_mw) / 2000.0;
+
+    /* Only account for the requested measurement window. */
+    if (ctx->sample_start_us > start_us) {
+        start_us = ctx->sample_start_us;
+        if (end_us <= start_us)
+            return;
+    }
+
+    if (ctx->sample_end_us != 0ULL && end_us > ctx->sample_end_us)
+        end_us = ctx->sample_end_us;
+
+    if (end_us <= start_us)
+        return;
+
+    ctx->sampled_energy_j += avg_w * ((double)(end_us - start_us) / 1e6);
+    ctx->sample_count++;
+}
+
+static void consume_samples(GpuEnergyContext *ctx,
+                            nvmlSample_t *samples,
+                            unsigned int count) {
+    if (!ctx || !samples || count == 0)
+        return;
+
+    qsort(samples, count, sizeof(*samples), sample_cmp_timestamp);
 
     for (unsigned int i = 0; i < count; ++i) {
         unsigned long long ts = samples[i].timeStamp;
         unsigned int mw = samples[i].sampleValue.uiVal;
 
-        if (ctx->have_previous_sample) {
-            if (ts > ctx->previous_timestamp_us) {
-                double dt =
-                    (double)(ts - ctx->previous_timestamp_us) * 1e-6;
+        if (ts <= ctx->last_seen_us)
+            continue;
 
-                // A very large gap indicates that samples may have been lost from the driver's ring buffer.
-                if (dt <= 1.0) {
-                    double p0_w = (double)ctx->previous_power_mw / 1000.0;
-                    double p1_w = (double)mw / 1000.0;
-                    ctx->sampled_energy_j += ((p0_w + p1_w) * 0.5) * dt;
-                } else {
-                    ctx->measurement_valid = 0;
-                    fprintf(stderr, "NVML: gap of %.6f s between power samples; measurement marked as invalid.\n", dt);
-                }
-            }
-        } else {
-            ctx->have_previous_sample = 1;
+        /* The first sample establishes the power immediately before/after the
+         * measurement boundary.  Subsequent samples form trapezoids. */
+        if (!ctx->last_sample_valid) {
+            ctx->last_sample_ts = ts;
+            ctx->last_sample_mw = mw;
+            ctx->last_sample_valid = 1;
+            ctx->last_seen_us = ts;
+            continue;
         }
 
-        ctx->previous_timestamp_us = ts;
-        ctx->previous_power_mw = mw;
-        ctx->last_seen_timestamp_us = ts;
-        ctx->sample_count++;
+        if (ctx->sample_end_us != 0ULL && ts > ctx->sample_end_us) {
+            ctx->last_seen_us = ts;
+            continue;
+        }
+
+        integrate_between(ctx, ts, mw);
+        ctx->last_sample_ts = ts;
+        ctx->last_sample_mw = mw;
+        ctx->last_seen_us = ts;
     }
 }
 
-static void drain_power_samples(GpuEnergyContext *ctx) {
+static void drain_samples(GpuEnergyContext *ctx) {
+    if (!ctx || ctx->method != GPU_POWER_SAMPLES_BUFFER)
+        return;
 
     nvmlSample_t *samples = NULL;
     unsigned int count = 0;
+    nvmlReturn_t rc = get_power_samples_since(ctx, ctx->last_seen_us,
+                                               &samples, &count);
 
-    nvmlReturn_t rc = fetch_power_samples(
-        ctx,
-        ctx->last_seen_timestamp_us,
-        &samples,
-        &count
-    );
+    if (rc == NVML_ERROR_NOT_FOUND)
+        return;
 
-    if (rc == NVML_SUCCESS) {
-        consume_samples(ctx, samples, count);
+    if (rc != NVML_SUCCESS) {
+        append_error(ctx, "nvmlDeviceGetSamples(drain)", rc);
         free(samples);
-    } else if (rc != NVML_ERROR_NOT_FOUND) {
-        fprintf(stderr, "NVML: failed to get power samples: %s\n", nvmlErrorString(rc));
-        ctx->measurement_valid = 0;
-    }
-}
-
-static void *sample_thread_fn(void *arg) {
-    GpuEnergyContext *ctx = (GpuEnergyContext *)arg;
-
-    while (atomic_load_explicit(&ctx->running, memory_order_relaxed)) {
-        drain_power_samples(ctx);
-        sleep_ms(SAMPLE_POLL_INTERVAL_MS);
+        return;
     }
 
-    // Final drain after the measured batch has ended.
-    drain_power_samples(ctx);
-
-    return NULL;
+    consume_samples(ctx, samples, count);
+    free(samples);
 }
 
-int gpu_energy_available(void) {
-    return 1;
+static const char *method_name(GpuPowerMethod method) {
+    switch (method) {
+        case GPU_POWER_TOTAL_ENERGY:
+            return "nvml_total_energy_consumption";
+        case GPU_POWER_SAMPLES_BUFFER:
+            return "nvml_power_samples_buffer";
+        default:
+            return "unavailable";
+    }
 }
 
 GpuEnergyContext *gpu_energy_init(int device_index) {
-
-    nvmlReturn_t rc = nvmlInit();
-    if (rc != NVML_SUCCESS) {
-        fprintf(stderr, "NVML: nvmlInit failed: %s\n", nvmlErrorString(rc));
-        return NULL;
-    }
-
     GpuEnergyContext *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        nvmlShutdown();
+    if (!ctx)
         return NULL;
-    }
 
-    rc = nvmlDeviceGetHandleByIndex(
-        (unsigned int)device_index,
-        &ctx->device
-    );
+    ctx->last_error[0] = '\0';
 
+    nvmlReturn_t rc = nvmlInit_v2();
     if (rc != NVML_SUCCESS) {
-        fprintf(stderr, "NVML: GPU %d unavailable: %s\n", device_index, nvmlErrorString(rc));
+        append_error(ctx, "nvmlInit_v2", rc);
+        fprintf(stderr, "GPU NVML error: %s\n", ctx->last_error);
         free(ctx);
-        nvmlShutdown();
         return NULL;
     }
 
-    /*
-     * Preferred method: cumulative energy counter.
-     */
-    unsigned long long test_mj = 0;
-    nvmlReturn_t energy_rc = nvmlDeviceGetTotalEnergyConsumption(ctx->device, &test_mj);
-
-    if (energy_rc == NVML_SUCCESS) {
-        ctx->use_total_energy_api = 1;
-        ctx->power_samples_supported = 0;
-
-        snprintf(ctx->method, sizeof(ctx->method), "NVML_total_energy");
-
-        fprintf(stderr, "NVML: cumulative energy available (mJ).\n");
-
-        ctx->measurement_valid = 1;
-        return ctx;
+    rc = nvmlDeviceGetHandleByIndex((unsigned int)device_index, &ctx->device);
+    if (rc != NVML_SUCCESS) {
+        append_error(ctx, "nvmlDeviceGetHandleByIndex", rc);
+        fprintf(stderr, "GPU NVML error: %s\n", ctx->last_error);
+        nvmlShutdown();
+        free(ctx);
+        return NULL;
     }
 
-    /*
-     * Fallback: driver-maintained total-power samples (GTX 1050 TI)
-     */
-    nvmlValueType_t value_type;
-    unsigned int count = 0;
+    rc = nvmlDeviceGetName(ctx->device,
+                           ctx->device_name,
+                           sizeof(ctx->device_name));
+    if (rc != NVML_SUCCESS)
+        snprintf(ctx->device_name, sizeof(ctx->device_name), "unknown");
 
-    nvmlReturn_t samples_rc = nvmlDeviceGetSamples(
-        ctx->device,
-        NVML_TOTAL_POWER_SAMPLES,
-        0,
-        &value_type,
-        &count,
-        NULL
-    );
+    unsigned long long energy_mj = 0;
+    rc = nvmlDeviceGetTotalEnergyConsumption(ctx->device, &energy_mj);
 
-    if (samples_rc == NVML_SUCCESS &&
-        value_type == NVML_VALUE_TYPE_UNSIGNED_INT) {
+    if (rc == NVML_SUCCESS) {
+        ctx->method = GPU_POWER_TOTAL_ENERGY;
+    } else {
+        append_error(ctx, "nvmlDeviceGetTotalEnergyConsumption(probe)", rc);
 
-        ctx->use_total_energy_api = 0;
-        ctx->power_samples_supported = 1;
-        ctx->measurement_valid = 1;
-
-        snprintf(ctx->method, sizeof(ctx->method), "NVML_power_samples");
-
-        fprintf(stderr, "NVML: cumulative energy not supported: %s\n", nvmlErrorString(energy_rc));
-        fprintf(stderr, "NVML: using NVML_TOTAL_POWER_SAMPLES " "(samples kept by the driver).\n");
-
-        return ctx;
+        nvmlReturn_t sample_rc = probe_power_samples(ctx);
+        if (sample_rc == NVML_SUCCESS || sample_rc == NVML_ERROR_NOT_FOUND) {
+            ctx->method = GPU_POWER_SAMPLES_BUFFER;
+        } else {
+            fprintf(stderr,
+                    "GPU NVML error: no supported GPU energy telemetry for %s\n",
+                    ctx->device_name);
+            fprintf(stderr, "  details: %s\n", ctx->last_error);
+            nvmlShutdown();
+            free(ctx);
+            return NULL;
+        }
     }
 
-    fprintf(stderr, "NVML: cumulative energy unavailable: %s\n", nvmlErrorString(energy_rc));
-    fprintf(stderr, "NVML: power samples unavailable: %s\n", nvmlErrorString(samples_rc));
+    fprintf(stderr, "GPU energy telemetry: %s (%s)\n",
+            ctx->device_name,
+            method_name(ctx->method));
 
-    free(ctx);
-    nvmlShutdown();
-    return NULL;
+    return ctx;
 }
 
 void gpu_energy_start(GpuEnergyContext *ctx) {
-
     if (!ctx)
         return;
 
-    ctx->measurement_valid = 1;
-    ctx->sampled_energy_j = 0.0;
+    ctx->last_measurement_valid = 0;
     ctx->sample_count = 0;
-    ctx->thread_created = 0;
-    ctx->have_previous_sample = 0;
-    ctx->last_seen_timestamp_us = 0;
-    ctx->previous_timestamp_us = 0;
-    ctx->previous_power_mw = 0;
+    ctx->sampled_energy_j = 0.0;
+    ctx->start_valid = 0;
+    ctx->last_seen_us = 0ULL;
+    ctx->last_sample_valid = 0;
+    ctx->last_sample_ts = 0ULL;
+    ctx->last_sample_mw = 0U;
 
-    if (ctx->use_total_energy_api) {
-        nvmlReturn_t rc =
-            nvmlDeviceGetTotalEnergyConsumption(
-                ctx->device,
-                &ctx->start_total_mj
-            );
+    if (ctx->method == GPU_POWER_TOTAL_ENERGY) {
+        unsigned long long start_mj = 0;
+        nvmlReturn_t rc = nvmlDeviceGetTotalEnergyConsumption(
+            ctx->device, &start_mj);
 
-        if (rc != NVML_SUCCESS) {
-            fprintf(stderr, "NVML: initial energy read failed: %s\n", nvmlErrorString(rc));
-            ctx->measurement_valid = 0;
+        if (rc == NVML_SUCCESS) {
+            ctx->start_total_mj = start_mj;
+            ctx->start_valid = 1;
+        } else {
+            append_error(ctx,
+                         "nvmlDeviceGetTotalEnergyConsumption(start)",
+                         rc);
         }
-
         return;
     }
 
-    if (!ctx->power_samples_supported) {
-        ctx->measurement_valid = 0;
-        return;
-    }
+    ctx->sample_start_us = realtime_us();
+    ctx->sample_end_us = 0ULL;
+    ctx->start_valid = (ctx->sample_start_us != 0ULL);
 
+    if (!ctx->start_valid)
+        return;
+
+    /* Prime the lastSeen timestamp with the samples already present.  This
+     * prevents warm-up/idle samples from being charged to the measurement. */
     nvmlSample_t *samples = NULL;
     unsigned int count = 0;
+    nvmlReturn_t rc = get_power_samples_since(ctx, 0ULL, &samples, &count);
 
-    nvmlReturn_t rc = fetch_power_samples(ctx, 0, &samples, &count);
+    if (rc == NVML_SUCCESS) {
+        qsort(samples, count, sizeof(*samples), sample_cmp_timestamp);
 
-    if (rc == NVML_SUCCESS && count > 0) {
-        const nvmlSample_t *last = &samples[count - 1];
-
-        ctx->last_seen_timestamp_us = last->timeStamp;
-        ctx->previous_timestamp_us = last->timeStamp;
-        ctx->previous_power_mw = last->sampleValue.uiVal;
-        ctx->have_previous_sample = 1;
-
+        consume_samples(ctx, samples, count);
         free(samples);
     } else if (rc != NVML_ERROR_NOT_FOUND) {
-        fprintf(stderr, "NVML: failed to establish power samples baseline: %s\n", nvmlErrorString(rc));
+        append_error(ctx, "nvmlDeviceGetSamples(start)", rc);
         free(samples);
-        ctx->measurement_valid = 0;
+        ctx->start_valid = 0;
         return;
     }
 
-    atomic_store_explicit(&ctx->running, 1, memory_order_relaxed);
+    /* If there is already a sample after the start boundary, consume it now. */
+    drain_samples(ctx);
+}
 
-    int prc = pthread_create(
-        &ctx->thread,
-        NULL,
-        sample_thread_fn,
-        ctx
-    );
-
-    if (prc != 0) {
-        fprintf(stderr, "NVML: pthread_create failed: %s\n", strerror(prc));
-        atomic_store_explicit(&ctx->running, 0, memory_order_relaxed);
-        ctx->measurement_valid = 0;
+void gpu_energy_poll(GpuEnergyContext *ctx) {
+    if (!ctx || !ctx->start_valid)
         return;
-    }
 
-    ctx->thread_created = 1;
+    if (ctx->method == GPU_POWER_SAMPLES_BUFFER)
+        drain_samples(ctx);
 }
 
 double gpu_energy_stop_joules(GpuEnergyContext *ctx) {
+    if (!ctx || !ctx->start_valid)
+        return 0.0;
 
-    if (!ctx)
-        return NAN;
-
-    if (ctx->use_total_energy_api) {
+    if (ctx->method == GPU_POWER_TOTAL_ENERGY) {
         unsigned long long end_mj = 0;
+        nvmlReturn_t rc = nvmlDeviceGetTotalEnergyConsumption(
+            ctx->device, &end_mj);
 
-        nvmlReturn_t rc =
-            nvmlDeviceGetTotalEnergyConsumption(
-                ctx->device,
-                &end_mj
-            );
-
-        if (rc != NVML_SUCCESS) {
-            fprintf(stderr, "NVML: final energy read failed: %s\n", nvmlErrorString(rc));
-            ctx->measurement_valid = 0;
-            return NAN;
+        if (rc == NVML_SUCCESS && end_mj >= ctx->start_total_mj) {
+            ctx->last_measurement_valid = 1;
+            return (double)(end_mj - ctx->start_total_mj) / 1000.0;
         }
 
-        if (end_mj < ctx->start_total_mj) {
-            fprintf(stderr, "NVML: energy counter went backwards.\n");
-            ctx->measurement_valid = 0;
-            return NAN;
+        if (rc != NVML_SUCCESS)
+            append_error(ctx, "nvmlDeviceGetTotalEnergyConsumption(stop)", rc);
+
+        ctx->last_measurement_valid = 0;
+        return 0.0;
+    }
+
+    if (ctx->method == GPU_POWER_SAMPLES_BUFFER) {
+        ctx->sample_end_us = realtime_us();
+        if (ctx->sample_end_us == 0ULL || ctx->sample_end_us <= ctx->sample_start_us) {
+            ctx->last_measurement_valid = 0;
+            return 0.0;
         }
 
-        return (double)(end_mj - ctx->start_total_mj) / 1000.0;
+        /* Final drain. No sample with a timestamp beyond the measurement end
+         * contributes to the integral. The last observed power is held until
+         * the end timestamp. */
+        drain_samples(ctx);
+
+        if (ctx->last_sample_valid && ctx->last_sample_ts < ctx->sample_end_us) {
+            unsigned long long end_us = ctx->sample_end_us;
+            unsigned long long start_us = ctx->last_sample_ts;
+            if (start_us < ctx->sample_start_us)
+                start_us = ctx->sample_start_us;
+
+            if (end_us > start_us) {
+                ctx->sampled_energy_j +=
+                    ((double)ctx->last_sample_mw / 1000.0) *
+                    ((double)(end_us - start_us) / 1e6);
+                ctx->sample_count++;
+            }
+        }
+
+        ctx->last_measurement_valid =
+            isfinite(ctx->sampled_energy_j) && ctx->sample_count >= 2;
+
+        return ctx->last_measurement_valid ? ctx->sampled_energy_j : 0.0;
     }
 
-    if (!ctx->power_samples_supported) {
-        ctx->measurement_valid = 0;
-        return NAN;
-    }
-
-    atomic_store_explicit(&ctx->running, 0, memory_order_relaxed);
-
-    if (ctx->thread_created) {
-        pthread_join(ctx->thread, NULL);
-        ctx->thread_created = 0;
-    }
-
-    /*
-     * We need at least two distinct driver samples to integrate P(t).
-     */
-    if (ctx->sample_count < 2) {
-        fprintf(stderr, "NVML: insufficient power samples: %llu\n", ctx->sample_count);
-        ctx->measurement_valid = 0;
-        return NAN;
-    }
-
-    if (!ctx->measurement_valid)
-        return NAN;
-
-    return ctx->sampled_energy_j;
+    return 0.0;
 }
 
-int gpu_energy_measurement_valid(const GpuEnergyContext *ctx) {
-    return ctx && ctx->measurement_valid;
+int gpu_energy_measurement_valid(GpuEnergyContext *ctx) {
+    return ctx ? ctx->last_measurement_valid : 0;
 }
 
-const char *gpu_energy_method(const GpuEnergyContext *ctx) {
-    return ctx ? ctx->method : "unavailable";
+const char *gpu_energy_method(GpuEnergyContext *ctx) {
+    return ctx ? method_name(ctx->method) : "unavailable";
 }
 
-void gpu_energy_shutdown(GpuEnergyContext *ctx) {
+const char *gpu_energy_error(GpuEnergyContext *ctx) {
+    if (!ctx || ctx->last_error[0] == '\0')
+        return "";
+    return ctx->last_error;
+}
 
+const char *gpu_energy_device_name(GpuEnergyContext *ctx) {
+    if (!ctx || ctx->device_name[0] == '\0')
+        return "unavailable";
+    return ctx->device_name;
+}
+
+void gpu_energy_destroy(GpuEnergyContext *ctx) {
     if (!ctx)
         return;
 
-    free(ctx);
     nvmlShutdown();
+    free(ctx);
 }
 
 #else
 
-struct GpuEnergyContext {
-    int unused;
-};
-
-int gpu_energy_available(void) {
-    return 0;
-}
+struct GpuEnergyContext { int unused; };
 
 GpuEnergyContext *gpu_energy_init(int device_index) {
     (void)device_index;
@@ -446,23 +481,37 @@ void gpu_energy_start(GpuEnergyContext *ctx) {
     (void)ctx;
 }
 
-double gpu_energy_stop_joules(GpuEnergyContext *ctx) {
+void gpu_energy_poll(GpuEnergyContext *ctx) {
     (void)ctx;
-    return NAN;
 }
 
-int gpu_energy_measurement_valid(const GpuEnergyContext *ctx) {
+double gpu_energy_stop_joules(GpuEnergyContext *ctx) {
+    (void)ctx;
+    return 0.0;
+}
+
+int gpu_energy_measurement_valid(GpuEnergyContext *ctx) {
     (void)ctx;
     return 0;
 }
 
-const char *gpu_energy_method(const GpuEnergyContext *ctx) {
+const char *gpu_energy_method(GpuEnergyContext *ctx) {
     (void)ctx;
     return "unavailable";
 }
 
-void gpu_energy_shutdown(GpuEnergyContext *ctx) {
+const char *gpu_energy_error(GpuEnergyContext *ctx) {
     (void)ctx;
+    return "NVML disabled at build time";
+}
+
+const char *gpu_energy_device_name(GpuEnergyContext *ctx) {
+    (void)ctx;
+    return "unavailable";
+}
+
+void gpu_energy_destroy(GpuEnergyContext *ctx) {
+    free(ctx);
 }
 
 #endif
