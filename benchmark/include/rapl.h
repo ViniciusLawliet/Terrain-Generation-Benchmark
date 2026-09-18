@@ -1,16 +1,13 @@
-#ifndef RAPL_H
-#define RAPL_H
+#ifndef BENCH_RAPL_H
+#define BENCH_RAPL_H
 
-#include <limits.h>
-
-#define RAPL_MAX_DOMAINS 8
+#define RAPL_MAX_DOMAINS 16
 
 typedef struct {
+    char energy_path[RAPL_MAX_DOMAINS][300];
+    unsigned long long max_range_uj[RAPL_MAX_DOMAINS];
     int count;
     int available;
-    char energy_path[RAPL_MAX_DOMAINS][PATH_MAX];
-    char name[RAPL_MAX_DOMAINS][64];
-    unsigned long long max_range_uj[RAPL_MAX_DOMAINS];
 } RaplContext;
 
 void rapl_init(RaplContext *ctx);
