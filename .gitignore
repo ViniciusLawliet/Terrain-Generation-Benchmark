@@ -1,5 +1,5 @@
-*.txt
 *.o
 *.obj
 
 /results
+/notes
