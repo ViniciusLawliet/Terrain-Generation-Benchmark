@@ -51,10 +51,6 @@ For setup instructions, dependencies, permissions, benchmark execution and usage
 
 Benchmark findings, performance and energy comparisons, and result visualizations are presented in **[Results](results.md)**.
 
-## Tested environment
-
-The recorded experiments were collected on Ubuntu 22.04.5 LTS with an Intel Core i5-2400 CPU (4 cores / 4 threads), 8 GB DDR3 RAM, and an NVIDIA GeForce GTX 1050 Ti with 4 GB GDDR5 memory.
-
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
