@@ -10,10 +10,9 @@ The instructions were tested on **Ubuntu 22.04.5 LTS (Jammy Jellyfish)** with an
 - [2. Enable CPU energy readings with RAPL](#2-enable-cpu-energy-readings-with-rapl)
 - [3. Build the project](#3-build-the-project)
 - [4. Run the benchmark](#4-run-the-benchmark)
-- [5. Commands Used for the Experiments](#5-commands-used-for-the-experiments)
-- [6. Export a terrain mesh without the benchmark](#6-export-a-terrain-mesh-without-the-benchmark)
-- [7. Terrain generator options](#7-terrain-generator-options)
-- [8. Troubleshooting](#8-troubleshooting)
+- [5. Export a terrain mesh without the benchmark](#5-export-a-terrain-mesh-without-the-benchmark)
+- [6. Terrain generator options](#6-terrain-generator-options)
+- [7. Troubleshooting](#7-troubleshooting)
 
 ## 1. Requirements
 
@@ -220,45 +219,7 @@ When `-g` is enabled, the harness first attempts to read NVML's total energy con
 
 If neither method is available, the CUDA program can still run, but GPU energy will be unavailable. The presence of `nvidia-smi` alone does not guarantee that the installed GPU/driver exposes a supported energy measurement method.
 
-## 5. Commands Used for the Experiments
-
-The experiments analyzed in this project were conducted using the following benchmark configurations. The tests covered four cubic grid dimensions (256³, 512³, 768³, and 1024³) and four execution variants: the sequential CPU baseline, OpenMP with two threads, OpenMP with four threads, and CUDA on the GPU. Each configuration was measured over 10 independent executions.
-
-The following commands were used to collect the benchmark measurements. The resulting comparisons, plots, and findings are presented in **[Results](results.md)**.
-
-```bash
-mkdir -p results/sequential results/openmp_2t results/openmp_4t results/cuda
-
-for N in 256 512 768 1024; do
-    ./benchmark/bench \
-        -b ./openmp/terrain_gen_openmp -n 10 \
-        -o "./results/sequential/n${N}" \
-        -- -x "$N" -y "$N" -z "$N" -t 1 -s 1234 || break
-done
-
-for N in 256 512 768 1024; do
-    ./benchmark/bench \
-        -b ./openmp/terrain_gen_openmp -n 10 \
-        -o "./results/openmp_2t/n${N}" \
-        -- -x "$N" -y "$N" -z "$N" -t 2 -s 1234 || break
-done
-
-for N in 256 512 768 1024; do
-    ./benchmark/bench \
-        -b ./openmp/terrain_gen_openmp -n 10 \
-        -o "./results/openmp_4t/n${N}" \
-        -- -x "$N" -y "$N" -z "$N" -t 4 -s 1234 || break
-done
-
-for N in 256 512 768 1024; do
-    ./benchmark/bench \
-        -b ./cuda/terrain_gen_cuda -n 10 -g \
-        -o "./results/cuda/n${N}" \
-        -- -x "$N" -y "$N" -z "$N" -s 1234 || break
-done
-```
-
-## 6. Export a terrain mesh without the benchmark
+## 5. Export a terrain mesh without the benchmark
 
 You do not need the benchmark harness when you only want to generate a terrain mesh. Run the desired executable directly and pass `-o <file.obj>` to export the resulting mesh.
 
@@ -280,7 +241,7 @@ You do not need the benchmark harness when you only want to generate a terrain m
 
 Open the generated Wavefront OBJ files in Blender, MeshLab, or another compatible 3D application. If `-o` is omitted, no OBJ file is written.
 
-## 7. Terrain generator options
+## 6. Terrain generator options
 
 These options are passed to `terrain_gen_openmp` or `terrain_gen_cuda` directly, or after `--` when invoking the benchmark harness.
 
@@ -305,7 +266,7 @@ For available options, run:
 ./benchmark/bench -h
 ```
 
-## 8. Troubleshooting
+## 7. Troubleshooting
 
 - **RAPL is unavailable or CPU energy is `N/A`:** confirm that the CPU/kernel exposes Intel RAPL, inspect `/sys/class/powercap/`, verify that the expected `energy_uj` file is readable by your user, and confirm that the path matches the reader in `benchmark/src/rapl.c`.
 - **`nvcc` is not found:** install the CUDA Toolkit and ensure its `bin` directory is on `PATH`.
