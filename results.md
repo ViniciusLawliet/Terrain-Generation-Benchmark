@@ -49,9 +49,11 @@ done
 
 ## 1. Execution time and speedup
 
-![Execution time by grid size](docs/plots/time_scaling.jpg)
-
-*Figure 1. Mean execution time by grid resolution, N (per axis); lower is better. The vertical axis is logarithmic.*
+<p align="center">
+  <img src="docs/plots/time_scaling.jpg" width="65%">
+  <br>
+  <em>Figure 1. Mean execution time by grid resolution, N (per axis); lower is better. The vertical axis is logarithmic.</em>
+</p>
 
 | Grid resolution, N (per axis) | Sequential (s) | OpenMP 4 threads (s) | OpenMP speedup | CUDA (s) | CUDA speedup |
 |---:|---:|---:|---:|---:|---:|
@@ -64,9 +66,11 @@ OpenMP maintains a relatively consistent speedup across all tested grid sizes, w
 
 ## 2. Energy consumption and EDP
 
-![Measured energy by grid size](docs/plots/energy_scaling.jpg)
-
-*Figure 2. Mean measured energy for each implementation.*
+<p align="center">
+  <img src="docs/plots/energy_scaling.jpg" width="65%">
+  <br>
+  <em>Figure 2. Mean measured energy for each implementation.</em>
+</p>
 
 At `N = 1024`, CUDA reduces measured energy consumption by 85.53% relative to the sequential baseline, while OpenMP with four threads achieves a 34.21% reduction. This highlights CUDA's advantage in energy efficiency for the largest tested workload.
 
