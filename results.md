@@ -135,6 +135,12 @@ At `N = 1024`, the 62.5 W limit achieves the lowest mean energy (77.09 J), while
 
 The same experiment was performed at `N = 2048` to evaluate the effect of power limits on a larger workload.
 
+<p align="center">
+  <img src="docs/plots/gpu_power_limit_changes.jpg" width="65%">
+  <br>
+  <em>Figure 3. Relative changes in execution time, total measured energy, and EDP across GPU power limits, compared with the 75 W baseline, for grid resolutions N = 1024 and N = 2048. The horizontal line at 0% represents the baseline configuration.</em>
+</p>
+
 | GPU power limit | Mean time (s; change vs. 75 W) | Total energy (J; change vs. 75 W) | EDP (J·s; change vs. 75 W) |
 |---:|---:|---:|---:|
 | 52.5 W | 7.573; +23.14% | 613.20; +5.20% | 4,764.11; +28.72% |
