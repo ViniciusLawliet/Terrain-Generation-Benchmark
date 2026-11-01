@@ -130,25 +130,3 @@ The GPU power limit was varied across 52.5, 57.5, 62.5, 67.5 and 75 W, while kee
 | 75 W | 0.779; baseline | 78.16; baseline | 72.70; baseline |
 
 At `N = 1024`, the 62.5 W limit achieves the lowest mean energy (77.09 J), while 67.5 W provides the lowest EDP (72.29 J·s). The 75 W setting delivers the shortest execution time. However, the differences in energy and EDP are small.
-
-### 4.2. Extended workload at `N = 2048`
-
-The same experiment was performed at `N = 2048` to evaluate the effect of power limits on a larger workload.
-
-<p align="center">
-  <img src="docs/plots/gpu_power_limit_changes.jpg" width="100%">
-  <br>
-  <em>Figure 3. Relative changes in execution time, total measured energy, and EDP across GPU power limits, compared with the 75 W baseline, for grid resolutions N = 1024 and N = 2048. The horizontal line at 0% represents the baseline configuration.</em>
-</p>
-
-| GPU power limit | Mean time (s; change vs. 75 W) | Total energy (J; change vs. 75 W) | EDP (J·s; change vs. 75 W) |
-|---:|---:|---:|---:|
-| 52.5 W | 7.573; +23.14% | 613.20; +5.20% | 4,764.11; +28.72% |
-| 57.5 W | 6.922; +12.56% | 585.78; +0.49% | 4,170.09; +12.67% |
-| 62.5 W | 6.471; +5.23% | 577.13; −0.99% | 3,846.38; +3.93% |
-| 67.5 W | 6.214; +1.05% | 581.58; −0.23% | 3,729.59; +0.77% |
-| 75.0 W | 6.150; baseline | 582.90; baseline | 3,701.05; baseline |
-
-The larger workload shows the same qualitative trade-off more clearly. At 52.5 W, GPU energy decreases from 406.37 J to 392.74 J (3.35% lower), but CPU-package energy increases from 176.53 J to 220.46 J (24.88% higher). Total measured energy consequently increases by 30.29 J (5.20%), and EDP worsens by 28.72%. At 62.5 W, mean total energy is 0.99% lower than at 75 W, but both execution time and EDP are higher. The 75 W setting provides the shortest time and lowest EDP in this larger workload.
-
-Taken together, the two grid sizes support the same conclusion: lowering the GPU power limit reduces GPU energy modestly, but the longer execution can offset that saving through additional CPU energy and a higher EDP. The effect is particularly clear under the strictest limit at `N = 2048`, while the smaller differences in total energy at `N = 1024` suggest that the benefit of intermediate limits is limited and workload-dependent.
